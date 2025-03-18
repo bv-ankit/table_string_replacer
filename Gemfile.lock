@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    table_string_replacer (0.2.0)
+    table_string_replacer (0.3.0)
 
 GEM
   remote: https://rubygems.org/

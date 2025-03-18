@@ -37,7 +37,56 @@ char *strcasestr(const char *haystack, const char *needle) {
 }
 #endif
 
-// Fast serialized PHP string replacement with improved memory handling
+// Helper function for binary-safe case-insensitive string search
+static char* binary_strcasestr(const char* haystack, long haystack_len, const char* needle, long needle_len) {
+    if (needle_len == 0) return (char*)haystack;
+    if (haystack_len < needle_len) return NULL;
+    
+    for (long i = 0; i <= haystack_len - needle_len; i++) {
+        long j;
+        for (j = 0; j < needle_len; j++) {
+            char h = haystack[i + j];
+            char n = needle[j];
+            if (toupper((unsigned char)h) != toupper((unsigned char)n))
+                break;
+        }
+        if (j == needle_len)
+            return (char*)(haystack + i);
+    }
+    
+    return NULL;
+}
+
+// Extract serialized string length safely handling binary content
+static long extract_serialized_len(const char* str, long max_len, long start_pos, char** endptr) {
+    // Ensure we have enough chars for a valid length
+    if (start_pos + 1 >= max_len) {
+        *endptr = NULL;
+        return 0;
+    }
+    
+    // Skip to first digit
+    long pos = start_pos;
+    while (pos < max_len && !isdigit(str[pos])) pos++;
+    
+    // Extract digits until we hit a colon
+    long val = 0;
+    while (pos < max_len && isdigit(str[pos])) {
+        val = val * 10 + (str[pos] - '0');
+        pos++;
+    }
+    
+    // Check for valid format (must end with colon)
+    if (pos < max_len && str[pos] == ':') {
+        *endptr = (char*)(str + pos);
+        return val;
+    } else {
+        *endptr = NULL;
+        return 0;
+    }
+}
+
+// Fast serialized PHP string replacement with improved memory handling and binary string support
 static VALUE rb_serialized_str_replace(VALUE self, VALUE orig_str, VALUE old_str, VALUE new_str) {
     // Ensure strings are properly initialized
     Check_Type(orig_str, T_STRING);
@@ -52,97 +101,208 @@ static VALUE rb_serialized_str_replace(VALUE self, VALUE orig_str, VALUE old_str
     long old_len = RSTRING_LEN(old_str);
     long new_len = RSTRING_LEN(new_str);
     
+    // Early optimization: if old string is empty or original is empty, return original
+    if (old_len == 0 || orig_len == 0) {
+        return rb_str_dup(orig_str);
+    }
+    
     // Early optimization: if old and new are identical, return original
     if (old_len == new_len && memcmp(old, new, old_len) == 0) {
         return rb_str_dup(orig_str);
     }
     
-    // Estimate result size more accurately to avoid reallocations
-    long max_replacements = orig_len / (old_len > 0 ? old_len : 1);
-    long size_diff = new_len - old_len;
-    long estimated_result_len = orig_len + (size_diff > 0 ? size_diff * max_replacements : 0) + 128;
+    // Pre-compute a more accurate size estimate by counting potential matches first
+    long count = 0;
+    long i = 0;
     
-    // Pre-allocate result buffer
+    // First-pass to count potential replacements in serialized strings
+    while (i < orig_len) {
+        // Look for serialized string marker pattern 's:'
+        if (i + 2 < orig_len && orig[i] == 's' && orig[i+1] == ':') {
+            char *endptr;
+            long len_val = extract_serialized_len(orig, orig_len, i+2, &endptr);
+            
+            // Valid PHP serialized string format: s:N:"content";
+            if (endptr && (endptr+1) < orig + orig_len && *(endptr+1) == '"') {
+                long content_start = (endptr + 2) - orig;
+                
+                if (content_start < orig_len) {
+                    // Only search within the actual serialized string content
+                    long search_limit = content_start + len_val;
+                    if (search_limit > orig_len) search_limit = orig_len;
+                    
+                    // Count occurrences within this serialized string
+                    char *pos = orig + content_start;
+                    char *end = orig + search_limit;
+                    long remaining = search_limit - content_start;
+                    
+                    while (remaining >= old_len) {
+                        char *found = binary_strcasestr(pos, remaining, old, old_len);
+                        if (found && found < end) {
+                            count++;
+                            long advance = found - pos + old_len;
+                            pos += advance;
+                            remaining -= advance;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                
+                // Skip past this serialized string entirely for the counting phase
+                i = content_start + len_val;
+                // Skip past closing quote and semicolon if present
+                if (i < orig_len && orig[i] == '"') i++;
+                if (i < orig_len && orig[i] == ';') i++;
+                continue;
+            }
+        }
+        i++;
+    }
+    
+    // Optimize allocation with more precise size calculation
+    long size_diff = new_len - old_len;
+    long estimated_result_len = orig_len + (size_diff > 0 ? size_diff * count : 0) + 256;
+    
+    // Pre-allocate result buffer - slightly oversized to minimize reallocations
     VALUE result = rb_str_new(NULL, estimated_result_len);
     char *res_ptr = RSTRING_PTR(result);
     long res_len = 0;
     
-    long i = 0;
+    // Cache the first character of the search string for faster initial checks
+    unsigned char first_char = (unsigned char)old[0];
+    unsigned char first_char_upper = toupper(first_char);
+    unsigned char first_char_lower = tolower(first_char);
+    
+    // Second pass to perform the actual replacements
+    i = 0;
     while (i < orig_len) {
-        // Check for serialized string marker
+        // Look for serialized string marker pattern 's:'
         if (i + 2 < orig_len && orig[i] == 's' && orig[i+1] == ':') {
             char *endptr;
-            long len_pos = i + 2;
+            long len_val = extract_serialized_len(orig, orig_len, i+2, &endptr);
             
-            // Extract length value more safely
-            if (len_pos < orig_len) {
-                long len_val = strtol(orig + len_pos, &endptr, 10);
+            // Valid PHP serialized string format: s:N:"content";
+            if (endptr && (endptr+1) < orig + orig_len && *(endptr+1) == '"') {
+                long content_start = (endptr + 2) - orig;
                 
-                // Verify we found a valid PHP serialized string
-                if (endptr && *endptr == ':' && (endptr+1) < orig + orig_len && *(endptr+1) == '"') {
-                    long content_start = (endptr + 2) - orig;
+                if (content_start < orig_len) {
+                    // Only search within the actual serialized string content
+                    long search_limit = content_start + len_val;
+                    if (search_limit > orig_len) search_limit = orig_len;
                     
-                    // Make sure content_start is within bounds
-                    if (content_start < orig_len) {
-                        // Only search within the actual serialized string content
-                        long search_limit = content_start + len_val;
-                        if (search_limit > orig_len) search_limit = orig_len;
+                    // Fast path: check if this serialized string might contain our pattern
+                    // by checking for the first character before doing a full search
+                    int potential_match = 0;
+                    for (long scan_pos = content_start; scan_pos < search_limit; scan_pos++) {
+                        unsigned char c = (unsigned char)orig[scan_pos];
+                        if (c == first_char || toupper(c) == first_char_upper || 
+                            tolower(c) == first_char_lower) {
+                            potential_match = 1;
+                            break;
+                        }
+                    }
+                    
+                    // Only do full search if potential match found
+                    if (potential_match) {
+                        char *pos = orig + content_start;
+                        char *end = orig + search_limit;
+                        long remaining = search_limit - content_start;
                         
-                        char *found = strcasestr(orig + content_start, old);
+                        char *found = binary_strcasestr(pos, remaining, old, old_len);
                         
                         // Found match within the serialized string content
-                        if (found && found < orig + search_limit) {
-                            // Verify we have enough space in result buffer (resize if needed)
-                            long needed_len = res_len + (found - (orig + i)) + new_len + 100;
-                            if (needed_len > estimated_result_len) {
-                                rb_str_resize(result, needed_len * 2);
-                                res_ptr = RSTRING_PTR(result);
-                                estimated_result_len = needed_len * 2;
-                            }
-                        
+                        if (found && found < end) {
+                            // Before applying replacement, ensure we have enough space
+                            long prefix_len = found - pos;
+                            
                             // Calculate new serialized string length
-                            long new_len_val = len_val - old_len + new_len;
+                            long modified_len = len_val + (new_len - old_len);
                             
-                            // Update the serialized string length indicator
+                            // Build the new serialized string header
                             char len_buf[32];
-                            int len_digits = snprintf(len_buf, sizeof(len_buf), "s:%ld:", new_len_val);
+                            int len_digits = snprintf(len_buf, sizeof(len_buf), "s:%ld:", modified_len);
                             
-                            // Copy prefix up to the 's:' marker
-                            memcpy(res_ptr + res_len, orig + i, 2);
-                            res_len += 2;
+                            // Ensure we have space in result buffer
+                            long needed_space = res_len + len_digits + prefix_len + new_len + 
+                                              (search_limit - (found + old_len)) + 16;
+                            if (needed_space > estimated_result_len) {
+                                estimated_result_len = (estimated_result_len * 3) / 2;
+                                if (estimated_result_len < needed_space)
+                                    estimated_result_len = needed_space + 256;
+                                rb_str_resize(result, estimated_result_len);
+                                res_ptr = RSTRING_PTR(result);
+                            }
                             
-                            // Copy new length
-                            memcpy(res_ptr + res_len, len_buf + 2, len_digits - 2);
-                            res_len += len_digits - 2;
+                            // Copy the serialized string header
+                            memcpy(res_ptr + res_len, len_buf, len_digits);
+                            res_len += len_digits;
                             
-                            // Copy from length end to the found match position
-                            long pre_len = found - (orig + content_start);
-                            memcpy(res_ptr + res_len, endptr, pre_len + 2);
-                            res_len += pre_len + 2;
+                            // Copy quote and prefix content
+                            res_ptr[res_len++] = '"';
+                            memcpy(res_ptr + res_len, pos, prefix_len);
+                            res_len += prefix_len;
                             
-                            // Copy the new replacement string
+                            // Copy the replacement string
                             memcpy(res_ptr + res_len, new, new_len);
                             res_len += new_len;
                             
-                            // Skip to after the replacement point
-                            i = found - orig + old_len;
+                            // Copy remainder of serialized string
+                            long suffix_len = search_limit - (found + old_len);
+                            if (suffix_len > 0) {
+                                memcpy(res_ptr + res_len, found + old_len, suffix_len);
+                                res_len += suffix_len;
+                            }
+                            
+                            // Add closing quote and semicolon
+                            res_ptr[res_len++] = '"';
+                            res_ptr[res_len++] = ';';
+                            
+                            // Skip past the entire processed serialized string
+                            i = search_limit;
+                            // Skip past closing quote and semicolon if present
+                            if (i < orig_len && orig[i] == '"') i++;
+                            if (i < orig_len && orig[i] == ';') i++;
                             continue;
                         }
                     }
+                    
+                    // No match found, copy serialized string as is
+                    long str_total_len;
+                    long end_pos = search_limit;
+                    
+                    // Find the end of the serialized string (should be quote+semicolon)
+                    if (end_pos < orig_len && orig[end_pos] == '"') end_pos++;
+                    if (end_pos < orig_len && orig[end_pos] == ';') end_pos++;
+                    
+                    str_total_len = end_pos - i;
+                    
+                    if (res_len + str_total_len > estimated_result_len) {
+                        estimated_result_len = (estimated_result_len * 3) / 2;
+                        if (estimated_result_len < res_len + str_total_len)
+                            estimated_result_len = res_len + str_total_len + 256;
+                        rb_str_resize(result, estimated_result_len);
+                        res_ptr = RSTRING_PTR(result);
+                    }
+                    
+                    memcpy(res_ptr + res_len, orig + i, str_total_len);
+                    res_len += str_total_len;
+                    i += str_total_len;
+                    continue;
                 }
             }
         }
         
         // If we didn't perform a replacement, copy the current character
         if (res_len >= estimated_result_len) {
-            rb_str_resize(result, estimated_result_len * 2);
+            estimated_result_len = (estimated_result_len * 3) / 2;
+            rb_str_resize(result, estimated_result_len);
             res_ptr = RSTRING_PTR(result);
-            estimated_result_len *= 2;
         }
         res_ptr[res_len++] = orig[i++];
     }
     
-    // Set final string length and terminate
+    // Set final string length
     rb_str_resize(result, res_len);
     
     return result;
@@ -315,4 +475,4 @@ void Init_table_string_replacer() {
     // Constants for thread safety documentation
     rb_define_const(mStringReplacer, "THREAD_SAFE", Qtrue);
     rb_define_const(mStringReplacer, "VERSION", rb_str_new_cstr(RSTRING_PTR(rb_const_get(mStringReplacer, rb_intern("VERSION")))));
-} 
+}
