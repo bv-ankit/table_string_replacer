@@ -60,9 +60,24 @@ After checking out the repo, run `bin/setup` to install dependencies. Then, run 
 
 To install this gem onto your local machine, run `bundle exec rake install`. To release a new version, update the version number in `version.rb`, and then run `bundle exec rake release`, which will create a git tag for the version, push git commits and the created tag, and push the `.gem` file to [rubygems.org](https://rubygems.org).
 
+## Updating the Gem
+
+1. Make your code changes and ensure all tests pass with `rake test`
+2. Update the version number in `lib/table_string_replacer/version.rb` following [Semantic Versioning](https://semver.org/) principles
+3. Update the CHANGELOG.md file with your changes
+4. Commit your changes to git
+5. Run `bundle exec rake release`, which will:
+   - Create a git tag for the version
+   - Push git commits and tags
+   - Build the gem and push it to RubyGems.org
+
+Alternatively, you can do these steps manually:
+1. Build the gem: `gem build table_string_replacer.gemspec`
+2. Push to RubyGems: `gem push table_string_replacer-x.x.x.gem` (where x.x.x is the version number)
+
 ## Contributing
 
-Bug reports and pull requests are welcome on GitHub at https://github.com/yourusername/table_string_replacer.
+Bug reports and pull requests are welcome on GitHub at https://github.com/bv-ankit/table_string_replacer.
 
 ## License
 
